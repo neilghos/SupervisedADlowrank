@@ -1,0 +1,2 @@
+anomalib==2.6.2
+numpy==1.26.4
