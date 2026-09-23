@@ -1,0 +1,59 @@
+dataset:
+  name: liver
+  format: folder
+  path: D:/miccai/datasets/Liver_AD/hist_DIY
+  task: segmentation
+
+  train_batch_size: 32
+  eval_batch_size: 32
+  num_workers: 0
+  image_size: 224
+  center_crop: null
+  normalization: none
+
+  normal_dir: D:/miccai/datasets/Liver_AD/hist_DIY/train/good
+  abnormal_dir: D:/miccai/datasets/Liver_AD/hist_DIY/test/ungood/img
+  mask: D:/miccai/datasets/Liver_AD/hist_DIY/test/ungood/label
+  normal_test_dir: D:/miccai/datasets/Liver_AD/hist_DIY/test/good/img
+  extensions: null
+
+  test_split_mode: from_dir
+  test_split_ratio: 0
+  val_split_mode: same_as_test
+  val_split_ratio: 1
+  seed: 80
+
+model:
+  name: low_rank
+  rank: 50
+  var_threshold: 0.0001
+  score_type: l1
+  fit_samples: 500
+
+metrics:
+  image:
+    - AUROC
+    - F1Score
+  pixel:
+    - AUROC
+    - PRO
+    - F1Score
+  threshold:
+    method: adaptive
+
+project:
+  seed: 80
+  path: ./results
+
+logging:
+  logger: []
+  log_graph: false
+
+trainer:
+  accelerator: auto
+  devices: 1
+  max_epochs: 1
+  enable_checkpointing: false
+  enable_progress_bar: true
+  num_sanity_val_steps: 0
+  precision: 32

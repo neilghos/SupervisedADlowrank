@@ -1,0 +1,51 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+imgs/
+
+# Readme files (exclude BMAD readmes, keep our local model readme)
+BMAD/**/README.md
+BMAD/README.md
+*README*.txt
+!src/README.md
+
+# Checkpoints, models and weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.weights
+*.bin
+weights/
+results/
+logs/
+
+# Environments and IDE
+.env
+.venv
+env/
+venv/
+ENV/
+.vscode/
+.idea/
+
+# Large datasets & archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+Datasets/
