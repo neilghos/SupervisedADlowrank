@@ -1,4 +1,4 @@
-"""Train/evaluate SpatialAD with frozen normal-reference pixel statistics."""
+"""Train/evaluate the reconstruction-free SpatialAD classifier."""
 
 from __future__ import annotations
 
@@ -86,42 +86,33 @@ def make_loader(samples, *, timestamps, batch_size, num_workers, shuffle):
 
 def bpr_loss(logits: Tensor, labels: Tensor) -> Tensor:
     logits = logits.flatten()
-    positive = logits[labels.flatten().bool()]
-    negative = logits[~labels.flatten().bool()]
+    binary_labels = labels.flatten().bool()
+    positive = logits[binary_labels]
+    negative = logits[~binary_labels]
     if positive.numel() == 0 or negative.numel() == 0:
-        return F.binary_cross_entropy_with_logits(logits, labels.float().flatten())
+        return F.binary_cross_entropy_with_logits(logits, binary_labels.float())
     return -F.logsigmoid(positive[:, None] - negative[None, :]).mean()
 
 
-def compute_loss(model, output, features, labels, *, loss_type, reconstruction_weight,
-                 classification_weight, pos_weight):
-    target_images = features.permute(0, 2, 1).reshape_as(output.reconstruction)
-    reconstruction_loss = F.mse_loss(output.reconstruction, target_images)
+def classification_loss(logits: Tensor, labels: Tensor, *, loss_type: str,
+                        pos_weight: Tensor | None) -> Tensor:
     if loss_type == "bpr":
-        classification_loss = bpr_loss(output.logits, labels)
-    else:
-        classification_loss = F.binary_cross_entropy_with_logits(
-            output.logits, labels.float(), pos_weight=pos_weight
-        )
-    total = reconstruction_weight * reconstruction_loss + classification_weight * classification_loss
-    return {
-        "loss": total,
-        "reconstruction_loss": reconstruction_loss,
-        "classification_loss": classification_loss,
-    }
+        return bpr_loss(logits, labels)
+    return F.binary_cross_entropy_with_logits(
+        logits, labels.float(), pos_weight=pos_weight
+    )
 
 
 @torch.inference_mode()
 def collect_predictions(model, loader, device, show_progress=False):
     model.eval()
-    scores, labels, reconstruction_scores = [], [], []
+    scores, labels = [], []
     iterator = tqdm(loader, desc="validation", unit="batch", leave=False) if show_progress else loader
     for features, target in iterator:
         output = model(features.to(device, non_blocking=True))
         scores.append(output.logits.detach().flatten().cpu())
         labels.append(target.flatten().cpu())
-        reconstruction_scores.append(output.reconstruction_score.detach().flatten().cpu())
-    return torch.cat(scores), torch.cat(labels), torch.cat(reconstruction_scores)
+    return torch.cat(scores), torch.cat(labels)
 
 
 def paper_metrics(scores: Tensor, labels: Tensor) -> dict[str, float]:
@@ -155,7 +146,7 @@ def groups_for_dataset(dataset: VADTimeSeriesDataset) -> list[str]:
 
 
 def evaluate_test(model, dataset, loader, device):
-    scores, labels, reconstruction_scores = collect_predictions(model, loader, device)
+    scores, labels = collect_predictions(model, loader, device)
     groups = groups_for_dataset(dataset)
     if len(groups) != len(labels):
         raise RuntimeError(f"Group count {len(groups)} != prediction count {len(labels)}")
@@ -166,38 +157,26 @@ def evaluate_test(model, dataset, loader, device):
             f"  {name}: AUROC={metrics['auroc'] * 100:.2f}, "
             f"FPR@95TPR={metrics['fpr_at_95_tpr'] * 100:.2f}"
         )
-    metrics = paper_metrics(reconstruction_scores, labels)
-    print(
-        f"  reconstruction-only: AUROC={metrics['auroc'] * 100:.2f}, "
-        f"FPR@95TPR={metrics['fpr_at_95_tpr'] * 100:.2f}"
-    )
 
 
 def train_one_epoch(model, loader, optimizer, device, *, loss_type,
-                    reconstruction_weight, classification_weight, pos_weight,
-                    epoch, epochs):
+                    classification_weight, pos_weight, epoch, epochs):
     model.train()
-    totals = {"loss": 0.0, "reconstruction_loss": 0.0, "classification_loss": 0.0}
+    total = 0.0
     progress = tqdm(loader, desc=f"train {epoch}/{epochs}", unit="batch")
     for features, labels in progress:
         features = features.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         output = model(features)
-        losses = compute_loss(
-            model, output, features, labels,
-            loss_type=loss_type,
-            reconstruction_weight=reconstruction_weight,
-            classification_weight=classification_weight,
-            pos_weight=pos_weight,
-        )
-        losses["loss"].backward()
+        loss = classification_loss(
+            output.logits, labels, loss_type=loss_type, pos_weight=pos_weight
+        ) * classification_weight
+        loss.backward()
         optimizer.step()
-        for name in totals:
-            totals[name] += float(losses[name].detach().item())
-        progress.set_postfix(loss=f"{totals['loss'] / (progress.n + 1):.4f}")
-    count = max(1, len(loader))
-    return {name: value / count for name, value in totals.items()}
+        total += float(loss.detach().item())
+        progress.set_postfix(loss=f"{total / (progress.n + 1):.4f}")
+    return total / max(1, len(loader))
 
 
 def main() -> None:
@@ -220,7 +199,6 @@ def main() -> None:
     parser.add_argument("--loss", choices=("bce", "bpr"), default="bce")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--reconstruction-weight", type=float, default=1.0)
     parser.add_argument("--classification-weight", type=float, default=1.0)
     parser.add_argument("--z-clip", type=float, default=8.0)
     parser.add_argument("--output-dir", default="results/spatial_ad")
@@ -241,7 +219,6 @@ def main() -> None:
         regime=args.regime,
         seed=args.seed,
     )
-    # This is fitted before the supervised split and uses normal images only.
     reference_mean, reference_std = fit_sensor_reference_stats(selected, image_size=255)
     train_samples, val_samples = stratified_split(selected, args.val_fraction, args.seed)
     train_dataset, train_loader = make_loader(
@@ -270,8 +247,9 @@ def main() -> None:
         reference_std=reference_std,
         z_clip=args.z_clip,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate,
-                                  weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
 
     train_labels = torch.from_numpy(train_dataset.labels.astype(np.float32))
     n_positive = train_labels.sum().item()
@@ -303,35 +281,33 @@ def main() -> None:
     best_auc, best_epoch, no_improvement = -float("inf"), 0, 0
     history = []
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_one_epoch(
+        train_loss = train_one_epoch(
             model, train_loader, optimizer, device,
             loss_type=args.loss,
-            reconstruction_weight=args.reconstruction_weight,
             classification_weight=args.classification_weight,
             pos_weight=pos_weight,
             epoch=epoch,
             epochs=args.epochs,
         )
-        val_scores, val_labels, _ = collect_predictions(
+        val_scores, val_labels = collect_predictions(
             model, val_loader, device, show_progress=True
         )
         val_metrics = paper_metrics(val_scores, val_labels)
         val_auc = val_metrics["auroc"]
-        history.append({"epoch": epoch, **train_metrics, "val_auroc": val_auc})
-        print(
-            f"epoch {epoch}: loss={train_metrics['loss']:.4f}, "
-            f"cls={train_metrics['classification_loss']:.4f}, "
-            f"val AUROC={val_auc * 100:.2f}"
-        )
+        history.append({"epoch": epoch, "loss": train_loss, "val_auroc": val_auc})
+        print(f"epoch {epoch}: loss={train_loss:.4f}, val AUROC={val_auc * 100:.2f}")
         if np.isfinite(val_auc) and val_auc > best_auc:
             best_auc, best_epoch, no_improvement = val_auc, epoch, 0
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "epoch": epoch,
-                "val_auroc": val_auc,
-                "args": vars(args),
-            }, checkpoint_path)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "val_auroc": val_auc,
+                    "args": vars(args),
+                },
+                checkpoint_path,
+            )
         else:
             no_improvement += 1
             if no_improvement >= args.patience:
