@@ -1,4 +1,4 @@
-"""Train/evaluate SpatialAD with BCE, BPR, or reverse-InfoNCE geometry."""
+"""Train/evaluate ResNet SpatialAD with BCE, BPR, or reverse-InfoNCE geometry."""
 
 from __future__ import annotations
 
@@ -94,17 +94,8 @@ def bpr_loss(logits: Tensor, labels: Tensor) -> Tensor:
     return -F.logsigmoid(positive[:, None] - negative[None, :]).mean()
 
 
-def reverse_infonce_loss(
-    embeddings: Tensor,
-    labels: Tensor,
-    temperature: float = 0.1,
-) -> Tensor:
-    """Two directional reverse-InfoNCE terms.
-
-    For good anchors, cross-class good-bad similarity mass is minimized against
-    same-class good-good similarity mass.  The bad-anchor term is symmetric.
-    ``logsumexp`` provides the InfoNCE-style temperature aggregation.
-    """
+def reverse_infonce_loss(embeddings: Tensor, labels: Tensor, temperature: float = 0.1) -> Tensor:
+    """Two directional reverse-InfoNCE terms for good and bad anchors."""
 
     if temperature <= 0:
         raise ValueError("temperature must be positive")
@@ -116,13 +107,10 @@ def reverse_infonce_loss(
     similarity = (z @ z.transpose(0, 1)) / temperature
     n = z.shape[0]
     off_diagonal = ~torch.eye(n, dtype=torch.bool, device=z.device)
-    good_anchors = ~y
-    bad_anchors = y
-
     directional_losses = []
     for anchor_mask, positive_mask, negative_mask in (
-        (good_anchors, good_anchors, bad_anchors),
-        (bad_anchors, bad_anchors, good_anchors),
+        (~y, ~y, y),
+        (y, y, ~y),
     ):
         for anchor_index in torch.where(anchor_mask)[0]:
             positive = off_diagonal[anchor_index] & positive_mask
@@ -132,7 +120,6 @@ def reverse_infonce_loss(
             push_mass = torch.logsumexp(similarity[anchor_index][negative], dim=0)
             pull_mass = torch.logsumexp(similarity[anchor_index][positive], dim=0)
             directional_losses.append(push_mass - pull_mass)
-
     if not directional_losses:
         return z.sum() * 0.0
     return torch.stack(directional_losses).mean()
@@ -142,9 +129,7 @@ def classification_loss(logits: Tensor, labels: Tensor, *, loss_type: str,
                         pos_weight: Tensor | None) -> Tensor:
     if loss_type == "bpr":
         return bpr_loss(logits, labels)
-    return F.binary_cross_entropy_with_logits(
-        logits, labels.float(), pos_weight=pos_weight
-    )
+    return F.binary_cross_entropy_with_logits(logits, labels.float(), pos_weight=pos_weight)
 
 
 @torch.inference_mode()
@@ -175,9 +160,7 @@ def group_masks(groups: list[str]) -> dict[str, Tensor]:
     return {
         "all": torch.ones(len(groups), dtype=torch.bool),
         "seen_defects": torch.from_numpy(np.isin(values, ["good", "bad"])),
-        "unseen_defects": torch.from_numpy(
-            np.isin(values, ["good", "bad_unseen_defects"])
-        ),
+        "unseen_defects": torch.from_numpy(np.isin(values, ["good", "bad_unseen_defects"])),
     }
 
 
@@ -197,19 +180,14 @@ def evaluate_test(model, dataset, loader, device):
     print("test metrics:")
     for name, mask in group_masks(groups).items():
         metrics = paper_metrics(scores[mask], labels[mask])
-        print(
-            f"  {name}: AUROC={metrics['auroc'] * 100:.2f}, "
-            f"FPR@95TPR={metrics['fpr_at_95_tpr'] * 100:.2f}"
-        )
+        print(f"  {name}: AUROC={metrics['auroc'] * 100:.2f}, FPR@95TPR={metrics['fpr_at_95_tpr'] * 100:.2f}")
 
 
 def train_one_epoch(model, loader, optimizer, device, *, loss_type,
                     classification_weight, contrastive_weight, temperature,
                     pos_weight, epoch, epochs):
     model.train()
-    total = 0.0
-    total_cls = 0.0
-    total_reverse = 0.0
+    total = total_cls = total_reverse = 0.0
     progress = tqdm(loader, desc=f"train {epoch}/{epochs}", unit="batch")
     for features, labels in progress:
         features = features.to(device, non_blocking=True)
@@ -223,14 +201,11 @@ def train_one_epoch(model, loader, optimizer, device, *, loss_type,
             pos_weight=pos_weight,
         )
         reverse = reverse_infonce_loss(
-            output.contrastive_embedding,
-            labels,
-            temperature=temperature,
+            output.contrastive_embedding, labels, temperature=temperature
         )
+        loss = classification_weight * cls
         if loss_type in {"contrastive", "ratio"}:
-            loss = classification_weight * cls + contrastive_weight * reverse
-        else:
-            loss = classification_weight * cls
+            loss = loss + contrastive_weight * reverse
         loss.backward()
         optimizer.step()
         total += float(loss.detach().item())
@@ -259,7 +234,9 @@ def main() -> None:
     parser.add_argument("--timestamps", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--patch-size", type=int, default=15)
+    parser.add_argument("--backbone", choices=("resnet18", "resnet50"), default="resnet18")
+    parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train-backbone", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--nhead", type=int, default=8)
@@ -273,7 +250,7 @@ def main() -> None:
     parser.add_argument("--classification-weight", type=float, default=1.0)
     parser.add_argument("--contrastive-weight", type=float, default=0.5)
     parser.add_argument("--z-clip", type=float, default=8.0)
-    parser.add_argument("--output-dir", default="results/spatial_ad")
+    parser.add_argument("--output-dir", default="results/spatial_ad_resnet")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
     seed_everything(args.seed)
@@ -309,7 +286,9 @@ def main() -> None:
 
     model = SpatialAD(
         image_size=255,
-        patch_size=args.patch_size,
+        backbone=args.backbone,
+        pretrained=args.pretrained,
+        freeze_backbone=not args.train_backbone,
         d_model=args.d_model,
         projection_dim=args.projection_dim,
         nhead=args.nhead,
@@ -334,19 +313,15 @@ def main() -> None:
     checkpoint_dir = Path(args.output_dir) / args.regime / f"seed{args.seed}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / "best.pt"
-    (checkpoint_dir / "config.json").write_text(
-        json.dumps(vars(args), indent=2), encoding="utf-8"
-    )
+    (checkpoint_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
 
     print(f"device: {device}")
-    print(f"model: SpatialAD + {args.loss} embedding objective")
-    print(f"patches: {model.grid_size}x{model.grid_size} ({model.n_patches} tokens)")
+    print(f"model: {args.backbone} SpatialAD + {args.loss} embedding objective")
+    print(f"backbone pretrained: {args.pretrained}, frozen: {not args.train_backbone}")
+    print(f"spatial feature tokens: {model.feature_grid}x{model.feature_grid} ({model.feature_grid ** 2})")
     print(f"projection dimension: {args.projection_dim}")
     print(f"contrastive temperature: {args.temperature}")
-    print(
-        "sensor reference: fitted from "
-        f"{int((selected['label'].astype(str) == 'good').sum())} normal images"
-    )
+    print(f"sensor reference: fitted from {int((selected['label'].astype(str) == 'good').sum())} normal images")
     print(f"train images/windows: {len(train_dataset.samples)}/{len(train_loader)}")
     print(f"validation images/windows: {len(val_dataset.samples)}/{len(val_loader)}")
     print(f"test images/windows: {len(test_dataset.samples)}/{len(test_loader)}")
@@ -366,9 +341,7 @@ def main() -> None:
             epoch=epoch,
             epochs=args.epochs,
         )
-        val_scores, val_labels = collect_predictions(
-            model, val_loader, device, show_progress=True
-        )
+        val_scores, val_labels = collect_predictions(model, val_loader, device, show_progress=True)
         val_metrics = paper_metrics(val_scores, val_labels)
         val_auc = val_metrics["auroc"]
         history.append({"epoch": epoch, **train_metrics, "val_auroc": val_auc})
@@ -400,9 +373,7 @@ def main() -> None:
         raise RuntimeError("No valid checkpoint was produced")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
-    (checkpoint_dir / "history.json").write_text(
-        json.dumps(history, indent=2), encoding="utf-8"
-    )
+    (checkpoint_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     print(f"best validation AUROC: {best_auc * 100:.2f} at epoch {best_epoch}")
     evaluate_test(model, test_dataset, test_loader, device)
 

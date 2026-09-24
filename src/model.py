@@ -1,4 +1,4 @@
-"""Patch-based SpatialAD with normal-reference channels and embeddings."""
+"""ImageNet-ResNet SpatialAD with normal-reference sensor statistics."""
 
 from __future__ import annotations
 
@@ -7,6 +7,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torchvision.models import (
+    ResNet18_Weights,
+    ResNet50_Weights,
+    resnet18,
+    resnet50,
+)
 
 from .utils import spatial_embedding_grid
 
@@ -21,18 +27,20 @@ class SpatialADOutput:
 
 
 class SpatialAD(nn.Module):
-    """Spatial patch Transformer with a supervised embedding head.
+    """ResNet spatial-feature encoder with supervised embedding heads.
 
-    Each pixel receives raw intensity and a frozen normal-reference z-score.
-    Spatial patch tokens are encoded jointly within each image.  The pooled
-    image representation feeds both the classifier and a normalized
-    projection head for supervised contrastive training.
+    Each independent image is converted to a normalized three-channel input
+    for an ImageNet ResNet. Its final convolutional feature map provides
+    spatial region tokens. A downsampled normal-reference z-score map is added
+    as an auxiliary token channel before spatial Transformer attention.
     """
 
     def __init__(
         self,
         image_size: int = 255,
-        patch_size: int = 15,
+        backbone: str = "resnet18",
+        pretrained: bool = True,
+        freeze_backbone: bool = True,
         d_model: int = 128,
         projection_dim: int = 64,
         nhead: int = 8,
@@ -44,8 +52,8 @@ class SpatialAD(nn.Module):
         z_clip: float = 8.0,
     ) -> None:
         super().__init__()
-        if image_size % patch_size != 0:
-            raise ValueError("image_size must be divisible by patch_size")
+        if backbone not in {"resnet18", "resnet50"}:
+            raise ValueError("backbone must be 'resnet18' or 'resnet50'")
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
         if projection_dim < 1:
@@ -54,14 +62,13 @@ class SpatialAD(nn.Module):
             raise ValueError("z_clip must be positive")
 
         self.image_size = image_size
-        self.patch_size = patch_size
-        self.grid_size = image_size // patch_size
-        self.n_patches = self.grid_size * self.grid_size
-        self.patch_dim = patch_size * patch_size
         self.sensor_count = image_size * image_size
         self.d_model = d_model
         self.projection_dim = projection_dim
+        self.backbone_name = backbone
+        self.freeze_backbone = freeze_backbone
         self.z_clip = z_clip
+        self.resnet_input_size = 224
 
         mean = torch.zeros(self.sensor_count) if reference_mean is None else reference_mean
         std = torch.ones(self.sensor_count) if reference_std is None else reference_std
@@ -69,11 +76,36 @@ class SpatialAD(nn.Module):
             raise ValueError("reference statistics must contain image_size**2 values")
         self.register_buffer("reference_mean", mean.detach().float().reshape(-1))
         self.register_buffer("reference_std", std.detach().float().reshape(-1).clamp_min(1e-3))
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
 
-        self.patch_embedding = nn.Linear(self.patch_dim * 2, d_model)
+        if backbone == "resnet18":
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            network = resnet18(weights=weights)
+            backbone_channels = 512
+        else:
+            weights = ResNet50_Weights.DEFAULT if pretrained else None
+            network = resnet50(weights=weights)
+            backbone_channels = 2048
+        self.backbone = nn.Sequential(*list(network.children())[:-2])
+        if freeze_backbone:
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad = False
+
+        # ResNet layer4 produces a 7x7 map for 224x224 input.
+        self.feature_grid = 7
+        self.feature_projection = nn.Linear(backbone_channels + 1, d_model)
         positional = spatial_embedding_grid(
-            self.grid_size,
-            self.grid_size,
+            self.feature_grid,
+            self.feature_grid,
             embed_dim=d_model,
         )
         self.register_buffer("positional_embedding", positional, persistent=False)
@@ -99,13 +131,20 @@ class SpatialAD(nn.Module):
             nn.Linear(d_model, projection_dim),
         )
 
-    def _patchify(self, images: Tensor) -> Tensor:
-        patches = F.unfold(
+    def _resnet_features(self, images: Tensor) -> Tensor:
+        images = F.interpolate(
             images,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
+            size=(self.resnet_input_size, self.resnet_input_size),
+            mode="bilinear",
+            align_corners=False,
         )
-        return patches.transpose(1, 2)
+        images = images.repeat(1, 3, 1, 1)
+        images = (images - self.imagenet_mean) / self.imagenet_std
+        if self.freeze_backbone:
+            self.backbone.eval()
+            with torch.no_grad():
+                return self.backbone(images)
+        return self.backbone(images)
 
     def forward(self, features: Tensor) -> SpatialADOutput:
         if features.ndim != 3:
@@ -128,15 +167,22 @@ class SpatialAD(nn.Module):
         z_images = sensor_z.permute(0, 2, 1).reshape(
             batch_size * timestamps, 1, self.image_size, self.image_size
         )
-        model_images = torch.cat((raw_images, z_images), dim=1)
 
-        tokens = self.patch_embedding(self._patchify(model_images))
+        feature_map = self._resnet_features(raw_images)
+        z_map = F.interpolate(
+            z_images,
+            size=feature_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        tokens = torch.cat((feature_map, z_map), dim=1).flatten(2).transpose(1, 2)
+        tokens = self.feature_projection(tokens)
         tokens = tokens + self.positional_embedding.unsqueeze(0)
         encoded = self.output_norm(self.spatial_encoder(tokens))
+
         embedding = encoded.mean(dim=1)
         logits = self.classifier(embedding).squeeze(-1)
         projection = F.normalize(self.projection_head(embedding), dim=-1)
-
         return SpatialADOutput(
             logits=logits.reshape(batch_size, timestamps),
             embedding=embedding.reshape(batch_size, timestamps, self.d_model),
