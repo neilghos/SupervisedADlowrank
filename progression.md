@@ -6,14 +6,14 @@ scores are diagnostic only.
 
 ## Main progression
 
-| Stage | Main change | Best validation AUROC | Test AUROC | Seen defects | Unseen defects | Test FPR@95TPR |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | First patch SpatialAD: raw intensity, spatial patches, classifier + reconstruction loss | 66.36 | 62.79 | 62.89 | 62.26 | 91.10 |
-| 2 | Frozen normal-reference per-pixel mean/std z-score channel added | 73.67 | 65.65 | 64.57 | 71.15 | 89.90 |
-| 3 | Normal-reference z-score, z_clip=16, reconstruction loss disabled | 67.19 | 67.96 | 67.46 | 70.49 | 87.30 |
-| 4 | Normal-reference z-score, z_clip=8, reconstruction loss disabled | N/A | 68.70 | 68.16 | 71.42 | 85.80 |
-| 5 | Reconstruction head and loss removed; BCE classifier baseline | 73.01 | 69.21 | 68.72 | 71.73 | 87.30 |
-| 6 | Shared encoder + two-direction reverse-InfoNCE embedding objective | 71.35 | **71.07** | **71.05** | 71.20 | **84.60** |
+| Stage | Main change                                                                             | Best validation AUROC | Test AUROC | Seen defects | Unseen defects | Test FPR@95TPR |
+| ----- | --------------------------------------------------------------------------------------- | --------------------: | ---------: | -----------: | -------------: | -------------: |
+| 1     | First patch SpatialAD: raw intensity, spatial patches, classifier + reconstruction loss |                 66.36 |      62.79 |        62.89 |          62.26 |          91.10 |
+| 2     | Frozen normal-reference per-pixel mean/std z-score channel added                        |                 73.67 |      65.65 |        64.57 |          71.15 |          89.90 |
+| 3     | Normal-reference z-score, z_clip=16, reconstruction loss disabled                       |                 67.19 |      67.96 |        67.46 |          70.49 |          87.30 |
+| 4     | Normal-reference z-score, z_clip=8, reconstruction loss disabled                        |                   N/A |      68.70 |        68.16 |          71.42 |          85.80 |
+| 5     | Reconstruction head and loss removed; BCE classifier baseline                           |                 73.01 |      69.21 |        68.72 |          71.73 |          87.30 |
+| 6     | Shared encoder + two-direction reverse-InfoNCE embedding objective                      |                 71.35 |  **71.07** |    **71.05** |          71.20 |      **84.60** |
 
 ## Per-stage details
 
@@ -138,3 +138,5 @@ The largest gains came from:
 
 1. Modeling every pixel relative to its normal-reference distribution.
 2. Training a shared embedding with the two-direction reverse-InfoNCE objective.
+
+SOTA aucroc is 96.5
