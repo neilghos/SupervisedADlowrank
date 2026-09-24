@@ -6,14 +6,15 @@ scores are diagnostic only.
 
 ## Main progression
 
-| Stage | Main change                                                                             | Best validation AUROC | Test AUROC | Seen defects | Unseen defects | Test FPR@95TPR |
-| ----- | --------------------------------------------------------------------------------------- | --------------------: | ---------: | -----------: | -------------: | -------------: |
-| 1     | First patch SpatialAD: raw intensity, spatial patches, classifier + reconstruction loss |                 66.36 |      62.79 |        62.89 |          62.26 |          91.10 |
-| 2     | Frozen normal-reference per-pixel mean/std z-score channel added                        |                 73.67 |      65.65 |        64.57 |          71.15 |          89.90 |
-| 3     | Normal-reference z-score, z_clip=16, reconstruction loss disabled                       |                 67.19 |      67.96 |        67.46 |          70.49 |          87.30 |
-| 4     | Normal-reference z-score, z_clip=8, reconstruction loss disabled                        |                   N/A |      68.70 |        68.16 |          71.42 |          85.80 |
-| 5     | Reconstruction head and loss removed; BCE classifier baseline                           |                 73.01 |      69.21 |        68.72 |          71.73 |          87.30 |
-| 6     | Shared encoder + two-direction reverse-InfoNCE embedding objective                      |                 71.35 |  **71.07** |    **71.05** |          71.20 |      **84.60** |
+| Stage | Main change | Best validation AUROC | Test AUROC | Seen defects | Unseen defects | Test FPR@95TPR |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | First patch SpatialAD: raw intensity, spatial patches, classifier + reconstruction loss | 66.36 | 62.79 | 62.89 | 62.26 | 91.10 |
+| 2 | Frozen normal-reference per-pixel mean/std z-score channel added | 73.67 | 65.65 | 64.57 | 71.15 | 89.90 |
+| 3 | Normal-reference z-score, z_clip=16, reconstruction loss disabled | 67.19 | 67.96 | 67.46 | 70.49 | 87.30 |
+| 4 | Normal-reference z-score, z_clip=8, reconstruction loss disabled | N/A | 68.70 | 68.16 | 71.42 | 85.80 |
+| 5 | Reconstruction head and loss removed; BCE classifier baseline | 73.01 | 69.21 | 68.72 | 71.73 | 87.30 |
+| 6 | Shared encoder + two-direction reverse-InfoNCE embedding objective | 71.35 | 71.07 | 71.05 | 71.20 | 84.60 |
+| 7 | Frozen ImageNet ResNet18 spatial features + normal-reference z-map | N/A | **78.15** | **78.96** | **74.08** | **75.50** |
 
 ## Per-stage details
 
@@ -125,18 +126,35 @@ unseen defects:        71.20
 FPR@95TPR:             84.60
 ```
 
+### 7. ImageNet ResNet18 spatial features
+
+Each grayscale image was repeated into three channels, normalized with the
+ImageNet statistics, and passed through a frozen ResNet18. The final 7x7
+convolutional feature map became 49 spatial region tokens. The downsampled
+normal-reference z-score map was concatenated as an auxiliary feature channel.
+
+```text
+test AUROC:            78.15
+seen defects:          78.96
+unseen defects:        74.08
+FPR@95TPR:             75.50
+```
+
+This is the strongest result so far. The pretrained representation improved
+overall AUROC by more than seven points over the previous reverse-InfoNCE
+pixel-token model and substantially reduced FPR.
+
 ## Net change from the first SpatialAD model
 
 ```text
-test AUROC:       62.79 -> 71.07   (+8.28 points)
-seen AUROC:       62.89 -> 71.05   (+8.16 points)
-unseen AUROC:     62.26 -> 71.20   (+8.94 points)
-FPR@95TPR:        91.10 -> 84.60   (-6.50 points)
+test AUROC:       62.79 -> 78.15   (+15.36 points)
+seen AUROC:       62.89 -> 78.96   (+16.07 points)
+unseen AUROC:     62.26 -> 74.08   (+11.82 points)
+FPR@95TPR:        91.10 -> 75.50   (-15.60 points)
 ```
 
 The largest gains came from:
 
 1. Modeling every pixel relative to its normal-reference distribution.
 2. Training a shared embedding with the two-direction reverse-InfoNCE objective.
-
-SOTA aucroc is 96.5
+3. Replacing raw pixel patch tokens with pretrained ImageNet ResNet spatial features.
