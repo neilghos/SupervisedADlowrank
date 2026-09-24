@@ -1,4 +1,4 @@
-"""Patch-based SpatialAD with frozen normal-reference sensor statistics."""
+"""Patch-based SpatialAD with normal-reference channels and embeddings."""
 
 from __future__ import annotations
 
@@ -17,15 +17,16 @@ class SpatialADOutput:
 
     logits: Tensor
     embedding: Tensor
+    contrastive_embedding: Tensor
 
 
 class SpatialAD(nn.Module):
-    """Spatial patch Transformer with sensor-relative image channels.
+    """Spatial patch Transformer with a supervised embedding head.
 
-    Each pixel receives two channels: raw intensity and its z-score relative
-    to a frozen normal-reference distribution fitted outside this module.
-    The model performs attention over spatial patches and returns one
-    supervised anomaly logit plus one embedding per image.
+    Each pixel receives raw intensity and a frozen normal-reference z-score.
+    Spatial patch tokens are encoded jointly within each image.  The pooled
+    image representation feeds both the classifier and a normalized
+    projection head for supervised contrastive training.
     """
 
     def __init__(
@@ -33,6 +34,7 @@ class SpatialAD(nn.Module):
         image_size: int = 255,
         patch_size: int = 15,
         d_model: int = 128,
+        projection_dim: int = 64,
         nhead: int = 8,
         num_layers: int = 3,
         dim_feedforward: int = 512,
@@ -46,6 +48,8 @@ class SpatialAD(nn.Module):
             raise ValueError("image_size must be divisible by patch_size")
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
+        if projection_dim < 1:
+            raise ValueError("projection_dim must be positive")
         if z_clip <= 0:
             raise ValueError("z_clip must be positive")
 
@@ -56,6 +60,7 @@ class SpatialAD(nn.Module):
         self.patch_dim = patch_size * patch_size
         self.sensor_count = image_size * image_size
         self.d_model = d_model
+        self.projection_dim = projection_dim
         self.z_clip = z_clip
 
         mean = torch.zeros(self.sensor_count) if reference_mean is None else reference_mean
@@ -65,7 +70,6 @@ class SpatialAD(nn.Module):
         self.register_buffer("reference_mean", mean.detach().float().reshape(-1))
         self.register_buffer("reference_std", std.detach().float().reshape(-1).clamp_min(1e-3))
 
-        # Each patch contains raw intensity plus normal-reference z-score.
         self.patch_embedding = nn.Linear(self.patch_dim * 2, d_model)
         positional = spatial_embedding_grid(
             self.grid_size,
@@ -89,10 +93,13 @@ class SpatialAD(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, 1),
         )
+        self.projection_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, projection_dim),
+        )
 
     def _patchify(self, images: Tensor) -> Tensor:
-        """Convert ``[BT, channels, H, W]`` into ``[BT, patches, values]``."""
-
         patches = F.unfold(
             images,
             kernel_size=self.patch_size,
@@ -115,7 +122,6 @@ class SpatialAD(nn.Module):
         std = self.reference_std.to(dtype=features.dtype).view(1, sensor_count, 1)
         sensor_z = ((features - mean) / std).clamp(-self.z_clip, self.z_clip)
 
-        # T contains independent images; it is not treated as a temporal axis.
         raw_images = features.permute(0, 2, 1).reshape(
             batch_size * timestamps, 1, self.image_size, self.image_size
         )
@@ -124,14 +130,17 @@ class SpatialAD(nn.Module):
         )
         model_images = torch.cat((raw_images, z_images), dim=1)
 
-        patches = self._patchify(model_images)
-        tokens = self.patch_embedding(patches)
+        tokens = self.patch_embedding(self._patchify(model_images))
         tokens = tokens + self.positional_embedding.unsqueeze(0)
         encoded = self.output_norm(self.spatial_encoder(tokens))
-
         embedding = encoded.mean(dim=1)
         logits = self.classifier(embedding).squeeze(-1)
+        projection = F.normalize(self.projection_head(embedding), dim=-1)
+
         return SpatialADOutput(
             logits=logits.reshape(batch_size, timestamps),
             embedding=embedding.reshape(batch_size, timestamps, self.d_model),
+            contrastive_embedding=projection.reshape(
+                batch_size, timestamps, self.projection_dim
+            ),
         )

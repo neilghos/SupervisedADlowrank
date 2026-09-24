@@ -1,4 +1,4 @@
-"""Train/evaluate the reconstruction-free SpatialAD classifier."""
+"""Train/evaluate SpatialAD with BCE, BPR, or reverse-InfoNCE geometry."""
 
 from __future__ import annotations
 
@@ -94,6 +94,50 @@ def bpr_loss(logits: Tensor, labels: Tensor) -> Tensor:
     return -F.logsigmoid(positive[:, None] - negative[None, :]).mean()
 
 
+def reverse_infonce_loss(
+    embeddings: Tensor,
+    labels: Tensor,
+    temperature: float = 0.1,
+) -> Tensor:
+    """Two directional reverse-InfoNCE terms.
+
+    For good anchors, cross-class good-bad similarity mass is minimized against
+    same-class good-good similarity mass.  The bad-anchor term is symmetric.
+    ``logsumexp`` provides the InfoNCE-style temperature aggregation.
+    """
+
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    z = F.normalize(embeddings.reshape(-1, embeddings.shape[-1]), dim=-1)
+    y = labels.reshape(-1).bool()
+    if z.shape[0] < 2 or y.all() or (~y).all():
+        return z.sum() * 0.0
+
+    similarity = (z @ z.transpose(0, 1)) / temperature
+    n = z.shape[0]
+    off_diagonal = ~torch.eye(n, dtype=torch.bool, device=z.device)
+    good_anchors = ~y
+    bad_anchors = y
+
+    directional_losses = []
+    for anchor_mask, positive_mask, negative_mask in (
+        (good_anchors, good_anchors, bad_anchors),
+        (bad_anchors, bad_anchors, good_anchors),
+    ):
+        for anchor_index in torch.where(anchor_mask)[0]:
+            positive = off_diagonal[anchor_index] & positive_mask
+            negative = negative_mask
+            if not positive.any() or not negative.any():
+                continue
+            push_mass = torch.logsumexp(similarity[anchor_index][negative], dim=0)
+            pull_mass = torch.logsumexp(similarity[anchor_index][positive], dim=0)
+            directional_losses.append(push_mass - pull_mass)
+
+    if not directional_losses:
+        return z.sum() * 0.0
+    return torch.stack(directional_losses).mean()
+
+
 def classification_loss(logits: Tensor, labels: Tensor, *, loss_type: str,
                         pos_weight: Tensor | None) -> Tensor:
     if loss_type == "bpr":
@@ -160,23 +204,48 @@ def evaluate_test(model, dataset, loader, device):
 
 
 def train_one_epoch(model, loader, optimizer, device, *, loss_type,
-                    classification_weight, pos_weight, epoch, epochs):
+                    classification_weight, contrastive_weight, temperature,
+                    pos_weight, epoch, epochs):
     model.train()
     total = 0.0
+    total_cls = 0.0
+    total_reverse = 0.0
     progress = tqdm(loader, desc=f"train {epoch}/{epochs}", unit="batch")
     for features, labels in progress:
         features = features.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         output = model(features)
-        loss = classification_loss(
-            output.logits, labels, loss_type=loss_type, pos_weight=pos_weight
-        ) * classification_weight
+        cls = classification_loss(
+            output.logits,
+            labels,
+            loss_type="bpr" if loss_type == "bpr" else "bce",
+            pos_weight=pos_weight,
+        )
+        reverse = reverse_infonce_loss(
+            output.contrastive_embedding,
+            labels,
+            temperature=temperature,
+        )
+        if loss_type in {"contrastive", "ratio"}:
+            loss = classification_weight * cls + contrastive_weight * reverse
+        else:
+            loss = classification_weight * cls
         loss.backward()
         optimizer.step()
         total += float(loss.detach().item())
-        progress.set_postfix(loss=f"{total / (progress.n + 1):.4f}")
-    return total / max(1, len(loader))
+        total_cls += float(cls.detach().item())
+        total_reverse += float(reverse.detach().item())
+        progress.set_postfix(
+            loss=f"{total / (progress.n + 1):.4f}",
+            reverse=f"{total_reverse / (progress.n + 1):.4f}",
+        )
+    count = max(1, len(loader))
+    return {
+        "loss": total / count,
+        "classification_loss": total_cls / count,
+        "reverse_infonce_loss": total_reverse / count,
+    }
 
 
 def main() -> None:
@@ -188,18 +257,21 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--val-fraction", type=float, default=0.20)
     parser.add_argument("--timestamps", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--patch-size", type=int, default=15)
     parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dim-feedforward", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--loss", choices=("bce", "bpr"), default="bce")
+    parser.add_argument("--loss", choices=("bce", "bpr", "contrastive", "ratio"), default="bce")
+    parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--classification-weight", type=float, default=1.0)
+    parser.add_argument("--contrastive-weight", type=float, default=0.5)
     parser.add_argument("--z-clip", type=float, default=8.0)
     parser.add_argument("--output-dir", default="results/spatial_ad")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -239,6 +311,7 @@ def main() -> None:
         image_size=255,
         patch_size=args.patch_size,
         d_model=args.d_model,
+        projection_dim=args.projection_dim,
         nhead=args.nhead,
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
@@ -266,8 +339,10 @@ def main() -> None:
     )
 
     print(f"device: {device}")
-    print("model: SpatialAD + normal-reference z-score")
+    print(f"model: SpatialAD + {args.loss} embedding objective")
     print(f"patches: {model.grid_size}x{model.grid_size} ({model.n_patches} tokens)")
+    print(f"projection dimension: {args.projection_dim}")
+    print(f"contrastive temperature: {args.temperature}")
     print(
         "sensor reference: fitted from "
         f"{int((selected['label'].astype(str) == 'good').sum())} normal images"
@@ -281,10 +356,12 @@ def main() -> None:
     best_auc, best_epoch, no_improvement = -float("inf"), 0, 0
     history = []
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
+        train_metrics = train_one_epoch(
             model, train_loader, optimizer, device,
             loss_type=args.loss,
             classification_weight=args.classification_weight,
+            contrastive_weight=args.contrastive_weight,
+            temperature=args.temperature,
             pos_weight=pos_weight,
             epoch=epoch,
             epochs=args.epochs,
@@ -294,8 +371,13 @@ def main() -> None:
         )
         val_metrics = paper_metrics(val_scores, val_labels)
         val_auc = val_metrics["auroc"]
-        history.append({"epoch": epoch, "loss": train_loss, "val_auroc": val_auc})
-        print(f"epoch {epoch}: loss={train_loss:.4f}, val AUROC={val_auc * 100:.2f}")
+        history.append({"epoch": epoch, **train_metrics, "val_auroc": val_auc})
+        print(
+            f"epoch {epoch}: loss={train_metrics['loss']:.4f}, "
+            f"cls={train_metrics['classification_loss']:.4f}, "
+            f"reverse_infonce={train_metrics['reverse_infonce_loss']:.4f}, "
+            f"val AUROC={val_auc * 100:.2f}"
+        )
         if np.isfinite(val_auc) and val_auc > best_auc:
             best_auc, best_epoch, no_improvement = val_auc, epoch, 0
             torch.save(
