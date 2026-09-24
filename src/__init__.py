@@ -2,7 +2,12 @@
 
 from .data import SupervisedVAD, describe_vad_test_split
 from .model import SpatialAD, SpatialADOutput
-from .torchdata import VADTimeSeriesDataset, make_vad_dataloader, make_vad_dataset
+from .torchdata import (
+    VADTimeSeriesDataset,
+    fit_sensor_reference_stats,
+    make_vad_dataloader,
+    make_vad_dataset,
+)
 
 __all__ = [
     "SupervisedVAD",
@@ -10,6 +15,7 @@ __all__ = [
     "SpatialADOutput",
     "VADTimeSeriesDataset",
     "describe_vad_test_split",
+    "fit_sensor_reference_stats",
     "make_vad_dataloader",
     "make_vad_dataset",
 ]

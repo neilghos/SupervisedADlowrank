@@ -60,6 +60,41 @@ def load_sensor_vector(path: str | Path, image_size: int) -> np.ndarray:
     return np.array(image, dtype=np.float32, copy=True).reshape(-1) / 255.0
 
 
+def fit_sensor_reference_stats(
+    samples: DataFrame,
+    image_size: int = 255,
+    std_floor: float = 1e-3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit one frozen normal-reference distribution per pixel sensor.
+
+    Only ``label == "good"`` images are used.  The statistics can therefore
+    be applied consistently to train, validation, and test images without
+    using anomaly labels or contaminating the reference with bad images.
+    """
+
+    normal_paths = samples.loc[samples["label"].astype(str) == "good", "image_path"]
+    if len(normal_paths) < 2:
+        raise ValueError(f"Need at least two normal images, found {len(normal_paths)}")
+
+    sensor_count = image_size * image_size
+    total = np.zeros(sensor_count, dtype=np.float64)
+    squared_total = np.zeros(sensor_count, dtype=np.float64)
+    for path in normal_paths.astype(str):
+        vector = load_sensor_vector(path, image_size).astype(np.float64, copy=False)
+        total += vector
+        squared_total += vector * vector
+
+    count = float(len(normal_paths))
+    mean = total / count
+    variance = squared_total / count - mean * mean
+    std = np.sqrt(np.maximum(variance, 0.0))
+    std = np.maximum(std, std_floor)
+    return (
+        torch.from_numpy(mean.astype(np.float32)),
+        torch.from_numpy(std.astype(np.float32)),
+    )
+
+
 class VADTimeSeriesDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     """Group VAD images into feature-by-timestamp windows."""
 

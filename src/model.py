@@ -1,4 +1,4 @@
-"""Patch-based spatial anomaly detector for VAD images."""
+"""Patch-based SpatialAD with frozen normal-reference sensor statistics."""
 
 from __future__ import annotations
 
@@ -22,7 +22,12 @@ class SpatialADOutput:
 
 
 class SpatialAD(nn.Module):
-    """Spatial patch Transformer with per-image supervised anomaly scores.
+    """Spatial patch Transformer with sensor-relative image channels.
+
+    Every pixel has a frozen normal-reference distribution.  For an input
+    value ``x[j]``, the model receives both the raw value and
+    ``z[j] = (x[j] - mean[j]) / std[j]``.  The reference statistics are fitted
+    outside this module using normal training images only.
 
     Input shape:
         ``[B, sensors, timestamps]`` where ``sensors = image_size**2``.
@@ -41,20 +46,35 @@ class SpatialAD(nn.Module):
         num_layers: int = 3,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
+        reference_mean: Tensor | None = None,
+        reference_std: Tensor | None = None,
+        z_clip: float = 8.0,
     ) -> None:
         super().__init__()
         if image_size % patch_size != 0:
             raise ValueError("image_size must be divisible by patch_size")
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
+        if z_clip <= 0:
+            raise ValueError("z_clip must be positive")
 
         self.image_size = image_size
         self.patch_size = patch_size
         self.grid_size = image_size // patch_size
         self.n_patches = self.grid_size * self.grid_size
         self.patch_dim = patch_size * patch_size
+        self.sensor_count = image_size * image_size
+        self.z_clip = z_clip
 
-        self.patch_embedding = nn.Linear(self.patch_dim, d_model)
+        mean = torch.zeros(self.sensor_count) if reference_mean is None else reference_mean
+        std = torch.ones(self.sensor_count) if reference_std is None else reference_std
+        if mean.numel() != self.sensor_count or std.numel() != self.sensor_count:
+            raise ValueError("reference statistics must contain image_size**2 values")
+        self.register_buffer("reference_mean", mean.detach().float().reshape(-1))
+        self.register_buffer("reference_std", std.detach().float().reshape(-1).clamp_min(1e-3))
+
+        # Each patch now contains raw intensity plus normal-reference z-score.
+        self.patch_embedding = nn.Linear(self.patch_dim * 2, d_model)
         positional = spatial_embedding_grid(
             self.grid_size,
             self.grid_size,
@@ -73,6 +93,7 @@ class SpatialAD(nn.Module):
         )
         self.spatial_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_norm = nn.LayerNorm(d_model)
+        # Reconstruct the raw image channel only.
         self.patch_decoder = nn.Linear(d_model, self.patch_dim)
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
@@ -80,7 +101,7 @@ class SpatialAD(nn.Module):
         )
 
     def _patchify(self, images: Tensor) -> Tensor:
-        """Convert ``[BT, 1, H, W]`` into ``[BT, patches, patch_pixels]``."""
+        """Convert ``[BT, channels, H, W]`` into ``[BT, patches, values]``."""
 
         patches = F.unfold(
             images,
@@ -90,7 +111,7 @@ class SpatialAD(nn.Module):
         return patches.transpose(1, 2)
 
     def _unpatchify(self, patches: Tensor) -> Tensor:
-        """Convert ``[BT, patches, patch_pixels]`` back to ``[BT, 1, H, W]``."""
+        """Convert raw-image patches ``[BT, patches, patch_pixels]`` back to images."""
 
         return F.fold(
             patches.transpose(1, 2),
@@ -104,28 +125,39 @@ class SpatialAD(nn.Module):
             raise ValueError(f"Expected [B, sensors, timestamps], got {tuple(features.shape)}")
 
         batch_size, sensor_count, timestamps = features.shape
-        expected_sensors = self.image_size * self.image_size
-        if sensor_count != expected_sensors:
+        if sensor_count != self.sensor_count:
             raise ValueError(
-                f"Expected {expected_sensors} sensors for {self.image_size}x{self.image_size}, "
+                f"Expected {self.sensor_count} sensors for {self.image_size}x{self.image_size}, "
                 f"got {sensor_count}"
             )
 
+        mean = self.reference_mean.to(dtype=features.dtype).view(1, sensor_count, 1)
+        std = self.reference_std.to(dtype=features.dtype).view(1, sensor_count, 1)
+        sensor_z = ((features - mean) / std).clamp(-self.z_clip, self.z_clip)
+
         # The timestamp axis contains independent images, not a temporal signal.
-        images = features.permute(0, 2, 1).reshape(
+        raw_images = features.permute(0, 2, 1).reshape(
             batch_size * timestamps,
             1,
             self.image_size,
             self.image_size,
         )
-        patches = self._patchify(images)
+        z_images = sensor_z.permute(0, 2, 1).reshape(
+            batch_size * timestamps,
+            1,
+            self.image_size,
+            self.image_size,
+        )
+        model_images = torch.cat((raw_images, z_images), dim=1)
+
+        patches = self._patchify(model_images)
         tokens = self.patch_embedding(patches)
         tokens = tokens + self.positional_embedding.unsqueeze(0)
         encoded = self.output_norm(self.spatial_encoder(tokens))
 
         reconstructed_patches = self.patch_decoder(encoded)
         reconstruction = self._unpatchify(reconstructed_patches)
-        anomaly_map = (reconstruction - images).abs()
+        anomaly_map = (reconstruction - raw_images).abs()
         reconstruction_score = anomaly_map.flatten(1).mean(dim=1)
 
         pooled = encoded.mean(dim=1)
@@ -164,7 +196,10 @@ class SpatialAD(nn.Module):
             output.logits,
             labels.float(),
         )
-        total = reconstruction_weight * reconstruction_loss + classification_weight * classification_loss
+        total = (
+            reconstruction_weight * reconstruction_loss
+            + classification_weight * classification_loss
+        )
         return {
             "loss": total,
             "reconstruction_loss": reconstruction_loss,
