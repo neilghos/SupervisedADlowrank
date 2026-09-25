@@ -1,4 +1,4 @@
-"""Jointly train/evaluate SpatialAD with ResNet or DINO spatial features."""
+"""Train and evaluate SpatialAD plus controlled backbone ablations."""
 
 from __future__ import annotations
 
@@ -51,8 +51,20 @@ def make_loader(samples, *, timestamps, batch_size, num_workers, shuffle):
     usable = (len(samples) // timestamps) * timestamps
     if usable < timestamps:
         raise ValueError(f"Split has {len(samples)} images; timestamps={timestamps}")
-    dataset = VADTimeSeriesDataset(samples.iloc[:usable].reset_index(drop=True), image_size=255, timestamps=timestamps, drop_last=True)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available(), persistent_workers=num_workers > 0)
+    dataset = VADTimeSeriesDataset(
+        samples.iloc[:usable].reset_index(drop=True),
+        image_size=255,
+        timestamps=timestamps,
+        drop_last=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
     return dataset, loader
 
 
@@ -65,27 +77,10 @@ def bpr_loss(logits: Tensor, labels: Tensor) -> Tensor:
     return -F.logsigmoid(positive[:, None] - negative[None, :]).mean()
 
 
-def reverse_infonce_loss(embeddings: Tensor, labels: Tensor, temperature: float) -> Tensor:
-    z = F.normalize(embeddings.reshape(-1, embeddings.shape[-1]), dim=-1)
-    y = labels.reshape(-1).bool()
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
-    if z.shape[0] < 2 or y.all() or (~y).all():
-        return z.sum() * 0.0
-    similarity = (z @ z.transpose(0, 1)) / temperature
-    off_diagonal = ~torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
-    losses = []
-    for anchor_mask, positive_mask, negative_mask in ((~y, ~y, y), (y, y, ~y)):
-        for index in torch.where(anchor_mask)[0]:
-            positive = off_diagonal[index] & positive_mask
-            negative = negative_mask
-            if positive.any() and negative.any():
-                losses.append(torch.logsumexp(similarity[index][negative], 0) - torch.logsumexp(similarity[index][positive], 0))
-    return torch.stack(losses).mean() if losses else z.sum() * 0.0
-
-
 def classification_loss(logits: Tensor, labels: Tensor, loss_type: str, pos_weight: Tensor) -> Tensor:
-    return bpr_loss(logits, labels) if loss_type == "bpr" else F.binary_cross_entropy_with_logits(logits, labels.float(), pos_weight=pos_weight)
+    if loss_type == "bpr":
+        return bpr_loss(logits, labels)
+    return F.binary_cross_entropy_with_logits(logits, labels.float(), pos_weight=pos_weight)
 
 
 @torch.inference_mode()
@@ -113,7 +108,11 @@ def paper_metrics(scores: Tensor, labels: Tensor) -> dict[str, float]:
 
 def group_masks(groups: list[str]) -> dict[str, Tensor]:
     values = np.asarray(groups, dtype=object)
-    return {"all": torch.ones(len(groups), dtype=torch.bool), "seen_defects": torch.from_numpy(np.isin(values, ["good", "bad"])), "unseen_defects": torch.from_numpy(np.isin(values, ["good", "bad_unseen_defects"]))}
+    return {
+        "all": torch.ones(len(groups), dtype=torch.bool),
+        "seen_defects": torch.from_numpy(np.isin(values, ["good", "bad"])),
+        "unseen_defects": torch.from_numpy(np.isin(values, ["good", "bad_unseen_defects"])),
+    }
 
 
 def groups_for_dataset(dataset: VADTimeSeriesDataset) -> list[str]:
@@ -133,25 +132,21 @@ def evaluate_test(model, dataset, loader, device):
         print(f"  {name}: AUROC={metrics['auroc'] * 100:.2f}, FPR@95TPR={metrics['fpr_at_95_tpr'] * 100:.2f}")
 
 
-def train_one_epoch(model, loader, optimizer, device, *, loss_type, contrastive_weight, temperature, pos_weight, epoch, epochs):
+def train_one_epoch(model, loader, optimizer, device, *, loss_type, pos_weight, epoch, epochs):
     model.train()
-    total = total_cls = total_contrastive = 0.0
+    total = 0.0
     progress = tqdm(loader, desc=f"train {epoch}/{epochs}", unit="batch")
     for features, labels in progress:
-        features, labels = features.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        features = features.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         output = model(features)
-        cls = classification_loss(output.logits, labels, loss_type, pos_weight)
-        contrastive = reverse_infonce_loss(output.contrastive_embedding, labels, temperature)
-        loss = cls + contrastive_weight * contrastive
+        loss = classification_loss(output.logits, labels, loss_type, pos_weight)
         loss.backward()
         optimizer.step()
         total += float(loss.detach().item())
-        total_cls += float(cls.detach().item())
-        total_contrastive += float(contrastive.detach().item())
-        progress.set_postfix(loss=f"{total / (progress.n + 1):.4f}", reverse=f"{total_contrastive / (progress.n + 1):.4f}")
-    count = max(1, len(loader))
-    return {"loss": total / count, "classification_loss": total_cls / count, "reverse_infonce_loss": total_contrastive / count}
+        progress.set_postfix(loss=f"{total / (progress.n + 1):.4f}")
+    return total / max(1, len(loader))
 
 
 def main() -> None:
@@ -163,30 +158,32 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--val-fraction", type=float, default=0.20)
     parser.add_argument("--timestamps", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--backbone", choices=("resnet18", "resnet50", "dino_small"), default="resnet18")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-backbone", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dim-feedforward", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--spatial-mode", choices=("transformer", "pool"), default="transformer")
+    parser.add_argument("--reference-z", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loss", choices=("bce", "bpr"), default="bce")
-    parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--contrastive-weight", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--z-clip", type=float, default=8.0)
     parser.add_argument("--output-dir", default="results/spatial_ad_dino")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
+
     seed_everything(args.seed)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
-    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device)
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
+    )
 
     dataset_root = resolve_dataset_root(args.root)
     selected = select_training_samples(make_supervised_vad_dataset(dataset_root, split="train"), args.regime, args.seed)
@@ -196,7 +193,22 @@ def main() -> None:
     val_dataset, val_loader = make_loader(val_samples, timestamps=args.timestamps, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
     test_dataset, test_loader = make_loader(make_supervised_vad_dataset(dataset_root, split="test"), timestamps=args.timestamps, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
 
-    model = SpatialAD(image_size=255, backbone=args.backbone, pretrained=args.pretrained, freeze_backbone=not args.train_backbone, d_model=args.d_model, projection_dim=args.projection_dim, nhead=args.nhead, num_layers=args.num_layers, dim_feedforward=args.dim_feedforward, dropout=args.dropout, reference_mean=reference_mean, reference_std=reference_std, z_clip=args.z_clip).to(device)
+    model = SpatialAD(
+        image_size=255,
+        backbone=args.backbone,
+        pretrained=args.pretrained,
+        freeze_backbone=not args.train_backbone,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout,
+        spatial_mode=args.spatial_mode,
+        use_reference_z=args.reference_z,
+        reference_mean=reference_mean,
+        reference_std=reference_std,
+        z_clip=args.z_clip,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     train_labels = torch.from_numpy(train_dataset.labels.astype(np.float32))
     n_positive = train_labels.sum().item()
@@ -208,21 +220,21 @@ def main() -> None:
     checkpoint_path = output_dir / "best.pt"
     (output_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     print(f"device: {device}")
-    print(f"model: {args.backbone} SpatialAD joint training")
+    print(f"model: {args.backbone} mode={args.spatial_mode} reference_z={args.reference_z} loss={args.loss}")
     print(f"backbone pretrained: {args.pretrained}, frozen: {not args.train_backbone}")
-    print(f"spatial feature tokens: {model.feature_grid}x{model.feature_grid} ({model.feature_grid ** 2})")
-    print(f"contrastive weight: {args.contrastive_weight}")
+    feature_h, feature_w = model.feature_grid
+    print(f"spatial feature tokens: {feature_h}x{feature_w} ({feature_h * feature_w})")
     print(f"train/val/test images: {len(train_dataset.samples)}/{len(val_dataset.samples)}/{len(test_dataset.samples)}")
     print(f"training labels: good={int(n_negative)}, bad={int(n_positive)}")
 
     best_auc, best_epoch, stale = -float("inf"), 0, 0
     history = []
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, loss_type=args.loss, contrastive_weight=args.contrastive_weight, temperature=args.temperature, pos_weight=pos_weight, epoch=epoch, epochs=args.epochs)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, loss_type=args.loss, pos_weight=pos_weight, epoch=epoch, epochs=args.epochs)
         val_scores, val_labels = collect_predictions(model, val_loader, device, show_progress=True)
         val_auc = paper_metrics(val_scores, val_labels)["auroc"]
-        history.append({"epoch": epoch, **train_metrics, "val_auroc": val_auc})
-        print(f"epoch {epoch}: loss={train_metrics['loss']:.4f}, cls={train_metrics['classification_loss']:.4f}, reverse={train_metrics['reverse_infonce_loss']:.4f}, val AUROC={val_auc * 100:.2f}")
+        history.append({"epoch": epoch, "loss": train_loss, "val_auroc": val_auc})
+        print(f"epoch {epoch}: loss={train_loss:.4f}, val AUROC={val_auc * 100:.2f}")
         if np.isfinite(val_auc) and val_auc > best_auc:
             best_auc, best_epoch, stale = val_auc, epoch, 0
             torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch, "val_auroc": val_auc, "args": vars(args)}, checkpoint_path)
