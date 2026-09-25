@@ -1,4 +1,4 @@
-"""Train and evaluate SpatialAD plus controlled backbone ablations."""
+"""Jointly train and evaluate SpatialAD with patch-density ablations."""
 
 from __future__ import annotations
 
@@ -51,20 +51,8 @@ def make_loader(samples, *, timestamps, batch_size, num_workers, shuffle):
     usable = (len(samples) // timestamps) * timestamps
     if usable < timestamps:
         raise ValueError(f"Split has {len(samples)} images; timestamps={timestamps}")
-    dataset = VADTimeSeriesDataset(
-        samples.iloc[:usable].reset_index(drop=True),
-        image_size=255,
-        timestamps=timestamps,
-        drop_last=True,
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-    )
+    dataset = VADTimeSeriesDataset(samples.iloc[:usable].reset_index(drop=True), image_size=255, timestamps=timestamps, drop_last=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available(), persistent_workers=num_workers > 0)
     return dataset, loader
 
 
@@ -108,11 +96,7 @@ def paper_metrics(scores: Tensor, labels: Tensor) -> dict[str, float]:
 
 def group_masks(groups: list[str]) -> dict[str, Tensor]:
     values = np.asarray(groups, dtype=object)
-    return {
-        "all": torch.ones(len(groups), dtype=torch.bool),
-        "seen_defects": torch.from_numpy(np.isin(values, ["good", "bad"])),
-        "unseen_defects": torch.from_numpy(np.isin(values, ["good", "bad_unseen_defects"])),
-    }
+    return {"all": torch.ones(len(groups), dtype=torch.bool), "seen_defects": torch.from_numpy(np.isin(values, ["good", "bad"])), "unseen_defects": torch.from_numpy(np.isin(values, ["good", "bad_unseen_defects"]))}
 
 
 def groups_for_dataset(dataset: VADTimeSeriesDataset) -> list[str]:
@@ -137,8 +121,7 @@ def train_one_epoch(model, loader, optimizer, device, *, loss_type, pos_weight, 
     total = 0.0
     progress = tqdm(loader, desc=f"train {epoch}/{epochs}", unit="batch")
     for features, labels in progress:
-        features = features.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        features, labels = features.to(device, non_blocking=True), labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         output = model(features)
         loss = classification_loss(output.logits, labels, loss_type, pos_weight)
@@ -160,6 +143,7 @@ def main() -> None:
     parser.add_argument("--timestamps", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--input-size", type=int, choices=(224, 448), default=224)
     parser.add_argument("--backbone", choices=("resnet18", "resnet50", "dino_small"), default="resnet18")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train-backbone", action=argparse.BooleanOptionalAction, default=False)
@@ -170,6 +154,7 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--spatial-mode", choices=("transformer", "pool"), default="transformer")
     parser.add_argument("--reference-z", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--patch-pooling", choices=("mean", "attention"), default="mean")
     parser.add_argument("--loss", choices=("bce", "bpr"), default="bce")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -181,10 +166,7 @@ def main() -> None:
     seed_everything(args.seed)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
-    device = torch.device(
-        "cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device
-    )
-
+    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else "cpu" if args.device == "auto" else args.device)
     dataset_root = resolve_dataset_root(args.root)
     selected = select_training_samples(make_supervised_vad_dataset(dataset_root, split="train"), args.regime, args.seed)
     reference_mean, reference_std = fit_sensor_reference_stats(selected, image_size=255)
@@ -193,22 +175,7 @@ def main() -> None:
     val_dataset, val_loader = make_loader(val_samples, timestamps=args.timestamps, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
     test_dataset, test_loader = make_loader(make_supervised_vad_dataset(dataset_root, split="test"), timestamps=args.timestamps, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
 
-    model = SpatialAD(
-        image_size=255,
-        backbone=args.backbone,
-        pretrained=args.pretrained,
-        freeze_backbone=not args.train_backbone,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dim_feedforward=args.dim_feedforward,
-        dropout=args.dropout,
-        spatial_mode=args.spatial_mode,
-        use_reference_z=args.reference_z,
-        reference_mean=reference_mean,
-        reference_std=reference_std,
-        z_clip=args.z_clip,
-    ).to(device)
+    model = SpatialAD(image_size=255, input_size=args.input_size, backbone=args.backbone, pretrained=args.pretrained, freeze_backbone=not args.train_backbone, d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers, dim_feedforward=args.dim_feedforward, dropout=args.dropout, spatial_mode=args.spatial_mode, use_reference_z=args.reference_z, patch_pooling=args.patch_pooling, reference_mean=reference_mean, reference_std=reference_std, z_clip=args.z_clip).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     train_labels = torch.from_numpy(train_dataset.labels.astype(np.float32))
     n_positive = train_labels.sum().item()
@@ -220,7 +187,7 @@ def main() -> None:
     checkpoint_path = output_dir / "best.pt"
     (output_dir / "config.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     print(f"device: {device}")
-    print(f"model: {args.backbone} mode={args.spatial_mode} reference_z={args.reference_z} loss={args.loss}")
+    print(f"model: {args.backbone} input_size={args.input_size} mode={args.spatial_mode} reference_z={args.reference_z} patch_pooling={args.patch_pooling} loss={args.loss}")
     print(f"backbone pretrained: {args.pretrained}, frozen: {not args.train_backbone}")
     feature_h, feature_w = model.feature_grid
     print(f"spatial feature tokens: {feature_h}x{feature_w} ({feature_h * feature_w})")

@@ -1,4 +1,4 @@
-"""SpatialAD models and controlled backbone ablations."""
+"""SpatialAD model with configurable DINO patch density and pooling ablations."""
 
 from __future__ import annotations
 
@@ -18,17 +18,12 @@ class SpatialADOutput(NamedTuple):
 
 
 class SpatialAD(nn.Module):
-    """Backbone classifier with optional reference z-map and spatial attention.
-
-    ``spatial_mode='pool'`` removes the SpatialAD Transformer.  For DINOv2
-    with ``use_reference_z=False`` this is the raw DINOv2 + classifier
-    ablation.  Enabling ``use_reference_z`` gives the matched DINOv2 + z-map
-    pooled control.
-    """
+    """Backbone features followed by spatial attention and patch pooling."""
 
     def __init__(
         self,
         image_size: int = 255,
+        input_size: int = 224,
         backbone: str = "resnet18",
         pretrained: bool = True,
         freeze_backbone: bool = True,
@@ -39,6 +34,7 @@ class SpatialAD(nn.Module):
         dropout: float = 0.1,
         spatial_mode: str = "transformer",
         use_reference_z: bool = True,
+        patch_pooling: str = "mean",
         z_clip: float = 8.0,
         reference_mean: Tensor | None = None,
         reference_std: Tensor | None = None,
@@ -46,18 +42,23 @@ class SpatialAD(nn.Module):
         super().__init__()
         if backbone not in {"resnet18", "resnet50", "dino_small"}:
             raise ValueError(f"Unknown backbone: {backbone}")
+        if input_size not in {224, 448}:
+            raise ValueError("input_size must be 224 or 448")
         if spatial_mode not in {"transformer", "pool"}:
             raise ValueError("spatial_mode must be 'transformer' or 'pool'")
+        if patch_pooling not in {"mean", "attention"}:
+            raise ValueError("patch_pooling must be 'mean' or 'attention'")
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead")
 
         self.image_size = image_size
+        self.input_size = input_size
         self.backbone_name = backbone
         self.spatial_mode = spatial_mode
         self.use_reference_z = use_reference_z
+        self.patch_pooling = patch_pooling
         self.freeze_backbone = freeze_backbone
         self.z_clip = float(z_clip)
-        self.input_size = 224
 
         if backbone == "resnet18":
             weights = ResNet18_Weights.DEFAULT if pretrained else None
@@ -72,15 +73,12 @@ class SpatialAD(nn.Module):
             self.backbone_channels = 2048
             self.feature_grid = (7, 7)
         else:
-            self.backbone = timm.create_model(
-                "vit_small_patch14_dinov2",
-                pretrained=pretrained,
-                num_classes=0,
-                global_pool="",
-                img_size=self.input_size,
-            )
+            self.backbone = timm.create_model("vit_small_patch14_dinov2", pretrained=pretrained, num_classes=0, global_pool="", img_size=input_size)
             self.backbone_channels = 384
-            self.feature_grid = (16, 16)
+            grid = self.backbone.patch_embed.grid_size
+            if isinstance(grid, int):
+                grid = (grid, grid)
+            self.feature_grid = tuple(int(value) for value in grid)
 
         if freeze_backbone:
             for parameter in self.backbone.parameters():
@@ -99,18 +97,14 @@ class SpatialAD(nn.Module):
         self.global_projection = nn.Linear(self.backbone_channels, d_model)
 
         if spatial_mode == "transformer":
-            layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
+            layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
             self.spatial_encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         else:
             self.spatial_encoder = None
+
+        self.patch_score = nn.Linear(d_model, 1)
+        nn.init.zeros_(self.patch_score.weight)
+        nn.init.zeros_(self.patch_score.bias)
         self.embedding_norm = nn.LayerNorm(d_model)
         self.classifier = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))
 
@@ -132,12 +126,10 @@ class SpatialAD(nn.Module):
         if self.backbone_name != "dino_small":
             feature_map = self.backbone(rgb)
             return feature_map, feature_map.mean(dim=(2, 3))
-
         tokens = self.backbone.forward_features(rgb)
         if isinstance(tokens, dict):
             if "x_norm_clstoken" in tokens and "x_norm_patchtokens" in tokens:
-                cls_features = tokens["x_norm_clstoken"]
-                patches = tokens["x_norm_patchtokens"]
+                cls_features, patches = tokens["x_norm_clstoken"], tokens["x_norm_patchtokens"]
             else:
                 tokens = tokens.get("x_prenorm", tokens.get("x_norm"))
                 if tokens is None:
@@ -171,6 +163,13 @@ class SpatialAD(nn.Module):
             position = position.reshape(height, width, -1)
         return position.reshape(1, height * width, -1)
 
+    def _pool_patches(self, tokens: Tensor) -> Tensor:
+        if self.patch_pooling == "mean":
+            return tokens.mean(dim=1)
+        scores = self.patch_score(tokens).squeeze(-1)
+        weights = torch.softmax(scores, dim=1)
+        return torch.sum(weights.unsqueeze(-1) * tokens, dim=1)
+
     def forward(self, x: Tensor) -> SpatialADOutput:
         if x.ndim != 3:
             raise ValueError(f"Expected [B, sensors, timestamps], got {tuple(x.shape)}")
@@ -196,7 +195,7 @@ class SpatialAD(nn.Module):
                 height, width = feature_map.shape[-2:]
                 tokens = tokens + self._positional_embedding(height, width, tokens.device, tokens.dtype)
                 tokens = self.spatial_encoder(tokens)
-            embedding = tokens.mean(dim=1)
+            embedding = self._pool_patches(tokens)
 
         embedding = self.embedding_norm(embedding)
         logits = self.classifier(embedding).squeeze(-1)
